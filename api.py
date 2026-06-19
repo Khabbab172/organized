@@ -1,135 +1,164 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, Request, Query, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 import chromadb
-import fitz
-import re
-import uuid
-import google.generativeai as genai
+from sentence_transformers import SentenceTransformer
+import math
+import os
+import shutil
+from injest import ingest_single
 
 app = FastAPI()
 
+# CORS — allow React frontend on any port
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory: session_id → collection_name
-sessions = {}
+model    = SentenceTransformer('all-MiniLM-L6-v2')
+client   = chromadb.PersistentClient(path="./chroma_db")
+collection = client.get_or_create_collection("pdfs")
+PDFS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdfs")
 
-def get_collection(session_id):
-    client = chromadb.PersistentClient(path="./chroma_db")
-    collection_name = f"session_{session_id}"
-    return client.get_or_create_collection(collection_name)
+# ── Legacy POST endpoint (kept for backward-compatibility) ────────────────────
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 8
 
-def extract_pages(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    for page_num, page in enumerate(doc, start=1):
-        text = page.get_text().strip()
-        if text:
-            pages.append({"page": page_num, "text": text})
-    return pages
-
-def clean_text(text):
-    text = re.sub(r'\.{4,}', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
-
-def chunk_text(text, chunk_size=500, overlap=100):
-    chunks = []
-    start = 0
-    while start < len(text):
-        chunks.append(text[start:start + chunk_size])
-        start += chunk_size - overlap
-    return chunks
-
-def get_embedding(text, api_key):
-    genai.configure(api_key=api_key)
-    result = genai.embed_content(
-        model="models/text-embedding-004",
-        content=text,
+@app.post("/search")
+def search_post(req: SearchRequest):
+    query_embedding = model.encode([req.query]).tolist()
+    results = collection.query(
+        query_embeddings=query_embedding,
+        n_results=min(req.top_k, collection.count() or 1),
     )
-    return result['embedding']
+    output = []
+    for doc, meta, distance in zip(
+        results["documents"][0],
+        results["metadatas"][0],
+        results["distances"][0],
+    ):
+        output.append({
+            "pdf_name": meta["pdf_name"],
+            "page":     meta["page"],
+            "snippet":  doc[:300],
+            "score":    round(1 - distance, 4),   # cosine similarity (0–1, higher = better)
+        })
+    return {"results": output}
 
-# ── Routes ────────────────────────────────────────────────────
+
+# ── Paginated GET endpoint ────────────────────────────────────────────────────
+MAX_FETCH = 200   # upper cap on how many chromadb results we retrieve
+
+@app.get("/search")
+def search_get(
+    q:         str = Query(...,  min_length=1, description="Search query"),
+    page:      int = Query(1,    ge=1,         description="1-based page number"),
+    page_size: int = Query(20,   ge=1, le=100, description="Results per page"),
+):
+    # 1. Determine how many results chromadb has available
+    total_in_db = collection.count() or 1
+    fetch_n     = min(MAX_FETCH, total_in_db)
+
+    # 2. Semantic search — fetch up to MAX_FETCH results
+    query_embedding = model.encode([q]).tolist()
+    results = collection.query(
+        query_embeddings=query_embedding,
+        n_results=fetch_n,
+    )
+
+    # 3. Build full sorted list (chromadb already returns by ascending distance)
+    all_results = []
+    for doc, meta, distance in zip(
+        results["documents"][0],
+        results["metadatas"][0],
+        results["distances"][0],
+    ):
+        all_results.append({
+            "pdf_name": meta["pdf_name"],
+            "page":     meta["page"],
+            "snippet":  doc[:300],
+            "score":    round(1 - distance, 4),   # cosine similarity
+        })
+
+    # already sorted by relevance (chromadb returns nearest-first → highest score first)
+    total        = len(all_results)
+    total_pages  = max(1, math.ceil(total / page_size))
+    page         = min(page, total_pages)            # clamp to valid range
+    start        = (page - 1) * page_size
+    end          = start + page_size
+    page_results = all_results[start:end]
+
+    return {
+        "results":     page_results,
+        "total":       total,
+        "page":        page,
+        "page_size":   page_size,
+        "total_pages": total_pages,
+    }
+
 
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {"status": "ok", "chunks": collection.count()}
 
-@app.get("/session")
-def create_session():
-    session_id = str(uuid.uuid4())
-    sessions[session_id] = True
-    return {"session_id": session_id}
 
-@app.post("/upload")
-async def upload_pdf(
-    file: UploadFile = File(...),
-    session_id: str = Form(...),
-    api_key: str = Form(...)
-):
-    pdf_bytes = await file.read()
-    pdf_name = file.filename
-    pages = extract_pages(pdf_bytes)
+# ── PDF Upload & Ingest ───────────────────────────────────────────────────────
+@app.post("/ingest")
+async def ingest_upload(files: list[UploadFile] = File(...)):
+    """
+    Accept one or more PDF file uploads, save them to ./pdfs,
+    then ingest only new/changed files using the hash registry.
+    """
+    results = []
+    for upload in files:
+        # Validate mime type
+        if not upload.filename.lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{upload.filename}' is not a PDF file.",
+            )
 
-    collection = get_collection(session_id)
+        dest_path = os.path.join(PDFS_DIR, upload.filename)
 
-    all_chunks = []
-    all_metadata = []
-    all_ids = []
+        # Save uploaded file to disk
+        with open(dest_path, "wb") as buffer:
+            shutil.copyfileobj(upload.file, buffer)
 
-    for page_data in pages:
-        cleaned = clean_text(page_data["text"])
-        chunks = chunk_text(cleaned)
-        for i, chunk in enumerate(chunks):
-            if len(chunk.strip()) < 50:
-                continue
-            all_chunks.append(chunk)
-            all_metadata.append({
-                "pdf_name": pdf_name,
-                "page": page_data["page"]
-            })
-            all_ids.append(f"{session_id}_{pdf_name}_p{page_data['page']}_c{i}")
+        # Ingest (skip if identical hash already registered)
+        result = ingest_single(dest_path)
+        results.append(result)
 
-    # Embed each chunk via Gemini
-    embeddings = []
-    for chunk in all_chunks:
-        emb = get_embedding(chunk, api_key)
-        embeddings.append(emb)
+    return {
+        "ingested": len([r for r in results if not r.get("skipped")]),
+        "skipped":  len([r for r in results if r.get("skipped")]),
+        "details":  results,
+        "total_chunks_in_db": collection.count(),
+    }
 
-    collection.upsert(
-        ids=all_ids,
-        documents=all_chunks,
-        embeddings=embeddings,
-        metadatas=all_metadata
+
+# ── List indexed PDFs ─────────────────────────────────────────────────────────
+@app.get("/pdfs/list")
+def list_pdfs():
+    """Return a list of PDF filenames currently in the pdfs folder."""
+    files = sorted(
+        f for f in os.listdir(PDFS_DIR) if f.lower().endswith(".pdf")
     )
+    return {"pdfs": files, "count": len(files)}
 
-    return {"status": "ok", "chunks": len(all_chunks), "pdf": pdf_name}
 
-@app.post("/search")
-async def search(body: dict):
-    session_id = body["session_id"]
-    query = body["query"]
-    api_key = body["api_key"]
-    top_k = body.get("top_k", 5)
+# ── Static PDF serving ────────────────────────────────────────────────────────
 
-    query_embedding = get_embedding(query, api_key)
-    collection = get_collection(session_id)
-
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k
-    )
-
-    output = []
-    for doc, meta in zip(results['documents'][0], results['metadatas'][0]):
-        output.append({
-            "pdf_name": meta['pdf_name'],
-            "page": meta['page'],
-            "snippet": doc[:300]
-        })
-
-    return {"results": output}
+@app.get("/pdfs/{filename:path}")
+def serve_pdf(filename: str):
+    safe_path = os.path.realpath(os.path.join(PDFS_DIR, filename))
+    if not safe_path.startswith(os.path.realpath(PDFS_DIR)):
+        return JSONResponse(status_code=403, content={"error": "Forbidden"})
+    if not os.path.isfile(safe_path):
+        return JSONResponse(status_code=404, content={"error": "PDF not found"})
+    return FileResponse(safe_path, media_type="application/pdf")
